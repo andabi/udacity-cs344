@@ -129,6 +129,23 @@ void gaussian_blur(const unsigned char* const inputChannel,
   // the value is out of bounds), you should explicitly clamp the neighbor values you read
   // to be within the bounds of the image. If this is not clear to you, then please refer
   // to sequential reference solution for the exact clamping semantics you should follow.
+
+  float res = 0.f;
+  int r = threadIdx.x;
+  int c = threadIdx.y;
+  for (int diff_r = -filterWidth/2; diff_r <= filterWidth/2; ++diff_r) {
+    for (int diff_c = -filterWidth/2; diff_c <= filterWidth/2; ++diff_c) {
+      int idx_r = r + diff_r;
+      int idx_c = c + diff_c;
+      if (idx_r < 0 || idx_r >= numRows || idx_c < 0 || idx_c >= numCols) {
+	continue;
+      }
+      int idx = idx_r * numCols + idx_c;
+      int idx_filter = (diff_r + filterWidth/2) * filterWidth + (diff_c + filterWidth/2);
+      res += inputChannel[idx] * filter[idx_filter];
+    }
+  }
+  outputChannel[r * numCols + c] = res;
 }
 
 //This kernel takes in an image represented as a uchar4 and splits
