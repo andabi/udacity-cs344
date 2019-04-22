@@ -133,6 +133,18 @@ void gaussian_blur(const unsigned char* const inputChannel,
   float res = 0.f;
   int r = threadIdx.x;
   int c = threadIdx.y;
+
+  if (r >= numRows || c >= numCols) {
+    return;
+  }
+
+  // shared memory
+//  const int input_size = numRows * numCols;
+  extern __shared__ char sh_input[];
+  int i = r * numCols + c;
+  sh_input[i] = inputChannel[i];
+  __syncthreads();
+
   for (int diff_r = -filterWidth/2; diff_r <= filterWidth/2; ++diff_r) {
     for (int diff_c = -filterWidth/2; diff_c <= filterWidth/2; ++diff_c) {
       int idx_r = r + diff_r;
@@ -142,10 +154,10 @@ void gaussian_blur(const unsigned char* const inputChannel,
       }
       int idx = idx_r * numCols + idx_c;
       int idx_filter = (diff_r + filterWidth/2) * filterWidth + (diff_c + filterWidth/2);
-      res += inputChannel[idx] * filter[idx_filter];
+      res += sh_input[idx] * filter[idx_filter];
     }
   }
-  outputChannel[r * numCols + c] = res;
+  outputChannel[i] = res;
 }
 
 //This kernel takes in an image represented as a uchar4 and splits
