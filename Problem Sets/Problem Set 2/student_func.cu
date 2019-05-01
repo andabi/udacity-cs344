@@ -140,24 +140,35 @@ gaussian_blur (const unsigned char* const inputChannel,
     }
 
   // shared memory
-//  const int input_size = numRows * numCols;
-//  extern __shared__ char sh_input[];
-//  sh_input[idx] = inputChannel[idx];
-//  __syncthreads ();
+  __shared__ unsigned char inputChannel_sh[32*32];
+  inputChannel_sh[threadIdx.x * blockDim.y + threadIdx.y] = inputChannel[idx];
+  __syncthreads ();
 
   float res = 0.f;
-  for (int diff_r = 0; diff_r < filterWidth; diff_r++)
+  for (int diff_r = -filterWidth / 2; diff_r <= filterWidth / 2; diff_r++)
     {
-      for (int diff_c = 0; diff_c < filterWidth; diff_c++)
+      for (int diff_c = -filterWidth / 2; diff_c <= filterWidth / 2; diff_c++)
 	{
-	  int idx_r = r + diff_r - filterWidth / 2;
-	  int idx_c = c + diff_c - filterWidth / 2;
+	  const int idx_filter = (diff_r + filterWidth / 2) * filterWidth
+	      + (diff_c + filterWidth / 2);
 
-	  idx_r = min (max (idx_r, 0), numRows - 1);
-	  idx_c = min (max (idx_c, 0), numCols - 1);
+	  int idx_r = r + diff_r;
+	  int idx_c = c + diff_c;
 
-	  int idx_filter = diff_r * filterWidth + diff_c;
-	  res += inputChannel[idx_r * numCols + idx_c] * filter[idx_filter];
+	  if (0 <= threadIdx.x + diff_r && threadIdx.x + diff_r < blockDim.x
+	      && 0 <= threadIdx.y + diff_c && threadIdx.y + diff_c < blockDim.y
+	      && 0 <= idx_r && idx_r < numRows && 0 <= idx_c && idx_c < numCols)
+	    {
+	      const int idx_sh = (threadIdx.x + diff_r) * blockDim.y
+		  + (threadIdx.y + diff_c);
+	      res += inputChannel_sh[idx_sh] * filter[idx_filter];
+	    }
+	  else
+	    {
+	      idx_r = min (max (idx_r, 0), numRows - 1);
+	      idx_c = min (max (idx_c, 0), numCols - 1);
+	      res += inputChannel[idx_r * numCols + idx_c] * filter[idx_filter];
+	    }
 	}
     }
 
