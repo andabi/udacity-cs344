@@ -80,48 +80,89 @@
  */
 
 #include "utils.h"
+#include "stdio.h"
 
-__global__ void min_step(const float* const d_input,
-                         float* const d_output,
-                         const int idx_steps,
-                         const int n_threads){
+__global__ void
+reduce_step (const float* const d_input, const int numPixels, float* const d_output,
+	     const int stride, const int n_threads, const bool is_min)
+{
 
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   // out-of-bound check
-  if (idx >= n_threads) {
+  if (thread_idx >= n_threads)
+    {
       return;
-  }
+    }
 
-  const int n_elems = sizeof(d_input) / sizeof(float);
-  if (n_elems <= idx + pow(2, idx_steps)) {
+  const int idx = thread_idx * stride;
+
+//  printf("%d, %d, %d, %d\n", n_threads, idx, stride, numPixels);
+
+  if (numPixels > idx + stride)
+    {
+      if (is_min) {
+        d_output[idx] = min (d_input[idx], d_input[idx + stride]);
+      } else {
+        d_output[idx] = max (d_input[idx], d_input[idx + stride]);
+      }
+    }
+  else
+    {
       d_output[idx] = d_input[idx];
-  } else {
-    d_output[idx] = min(d_input[idx], d_input[idx + pow(2, idx_steps)]);
-  }
+    }
 }
 
-float
-get_min (const float* const d_logLuminance)
+void
+reduce (const float* const d_input, const size_t numPixels, float* const d_output, const bool is_min)
 {
-  const int n_elems = sizeof(d_logLuminance)/sizeof(float);
-  assert (n_elems > 0);
+  assert(numPixels > 0);
 
-  float* d_output;
-  checkCudaError(cudaMalloc(&d_output, sizeof(float) * (int)ceil(n_elems/2)));
+  const int n_steps = ceil (log2 ((float) numPixels));
+  const float* d_temp = d_input;
 
-  const dim3 blockSize(32);
-
-  const int n_steps = ceil (log2 (n_elems));
-  float* d_input = d_logLuminance;
   for (int i = 0; i < n_steps; i++)
     {
-      int n_threads = ceil(n_elems/pow(2,i+1));
-      dim3 gridSize(n_threads/blockSize.x + 1);
-      min_step<<<gridSize, blockSize>>>(d_input, d_output, i, n_threads);
-      d_input = d_output;
+      int n_threads = ceil (numPixels / pow (2, i + 1));
+
+      const dim3 blockSize (32);
+      dim3 gridSize (n_threads / blockSize.x + 1);
+
+      const int stride = pow (2, i);
+      reduce_step <<<gridSize, blockSize>>> (d_temp, numPixels, d_output, stride,
+					     n_threads, is_min);
+      d_temp = d_output;
     }
-  return d_output[0];
+}
+
+void print_temp(const float* const d_data, const size_t numElem) {
+  float *h_data = (float *) malloc(sizeof(float)*numElem);
+  checkCudaErrors(cudaMemcpy(h_data, d_data, sizeof(float)*numElem, cudaMemcpyDeviceToHost));
+  for (int i = 0; i < numElem; i++)
+    {
+      std::cout << h_data[i] << ",";
+    }
+}
+
+void
+get_range (const float* const d_logLuminance, const size_t numPixels, float &min_logLum,
+	   float&max_logLum)
+{
+  float* d_output;
+  checkCudaErrors(
+      cudaMalloc (&d_output, sizeof(float) * numPixels));
+
+  reduce (d_logLuminance, numPixels, d_output, true);
+  checkCudaErrors(
+      cudaMemcpy (&min_logLum, d_output, sizeof(float),
+		  cudaMemcpyDeviceToHost));
+
+  reduce (d_logLuminance, numPixels, d_output, false);
+  checkCudaErrors(
+      cudaMemcpy (&max_logLum, d_output, sizeof(float),
+		  cudaMemcpyDeviceToHost));
+
+  checkCudaErrors(cudaFree (d_output));
 }
 
 void
@@ -141,6 +182,13 @@ your_histogram_and_prefixsum (const float* const d_logLuminance,
    the cumulative distribution of luminance values (this should go in the
    incoming d_cdf pointer which already has been allocated for you)       */
 
+  const size_t numPixels = numRows * numCols;
+//  const size_t numPixels = 10000;
+
   // find the min/max
-  min_logLum = get_min(d_logLuminance);
+  get_range (d_logLuminance, numPixels, min_logLum, max_logLum);
+
+  print_temp(d_logLuminance, numPixels);
+
+  printf ("min: %lf, max: %lf", min_logLum, max_logLum);
 }
