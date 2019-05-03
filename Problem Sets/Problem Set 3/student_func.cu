@@ -83,8 +83,9 @@
 #include "stdio.h"
 
 __global__ void
-reduce_step (const float* const d_input, const int numPixels, float* const d_output,
-	     const int stride, const int n_threads, const bool is_min)
+reduce_step (const float* const d_input, const int numPixels,
+	     float* const d_output, const int stride, const int n_threads,
+	     const bool is_min)
 {
 
   const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -95,17 +96,20 @@ reduce_step (const float* const d_input, const int numPixels, float* const d_out
       return;
     }
 
-  const int idx = thread_idx * stride;
+  const int idx = thread_idx * 2 * stride;
 
 //  printf("%d, %d, %d, %d\n", n_threads, idx, stride, numPixels);
 
   if (numPixels > idx + stride)
     {
-      if (is_min) {
-        d_output[idx] = min (d_input[idx], d_input[idx + stride]);
-      } else {
-        d_output[idx] = max (d_input[idx], d_input[idx + stride]);
-      }
+      if (is_min)
+	{
+	  d_output[idx] = min (d_input[idx], d_input[idx + stride]);
+	}
+      else
+	{
+	  d_output[idx] = max (d_input[idx], d_input[idx + stride]);
+	}
     }
   else
     {
@@ -114,7 +118,8 @@ reduce_step (const float* const d_input, const int numPixels, float* const d_out
 }
 
 void
-reduce (const float* const d_input, const size_t numPixels, float* const d_output, const bool is_min)
+reduce (const float* const d_input, const size_t numPixels,
+	float* const d_output, const bool is_min)
 {
   assert(numPixels > 0);
 
@@ -129,40 +134,67 @@ reduce (const float* const d_input, const size_t numPixels, float* const d_outpu
       dim3 gridSize (n_threads / blockSize.x + 1);
 
       const int stride = pow (2, i);
-      reduce_step <<<gridSize, blockSize>>> (d_temp, numPixels, d_output, stride,
-					     n_threads, is_min);
+      reduce_step <<<gridSize, blockSize>>> (d_temp, numPixels, d_output,
+					     stride, n_threads, is_min);
       d_temp = d_output;
     }
 }
 
-void print_temp(const float* const d_data, const size_t numElem) {
-  float *h_data = (float *) malloc(sizeof(float)*numElem);
-  checkCudaErrors(cudaMemcpy(h_data, d_data, sizeof(float)*numElem, cudaMemcpyDeviceToHost));
-  for (int i = 0; i < numElem; i++)
+void
+reduce_sequential (const float* const h_input, const size_t numPixels,
+		   float &h_output, const bool is_min)
+{
+  assert(numPixels > 0);
+
+  h_output = h_input[0];
+  for (int i = 1; i < numPixels; i++)
     {
-      std::cout << h_data[i] << ",";
+      if (is_min)
+	{
+	  h_output = min (h_output, h_input[i]);
+	}
+      else
+	{
+	  h_output = max (h_output, h_input[i]);
+	}
     }
 }
 
 void
-get_range (const float* const d_logLuminance, const size_t numPixels, float &min_logLum,
-	   float&max_logLum)
+find_range (const float* const d_logLuminance, const size_t numPixels,
+	    float &min_logLum, float &max_logLum, bool is_reference = false)
 {
   float* d_output;
-  checkCudaErrors(
-      cudaMalloc (&d_output, sizeof(float) * numPixels));
-
+  checkCudaErrors(cudaMalloc (&d_output, sizeof(float) * numPixels / 2));
   reduce (d_logLuminance, numPixels, d_output, true);
   checkCudaErrors(
       cudaMemcpy (&min_logLum, d_output, sizeof(float),
 		  cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaFree (d_output));
 
+  checkCudaErrors(cudaMalloc (&d_output, sizeof(float) * numPixels / 2));
   reduce (d_logLuminance, numPixels, d_output, false);
   checkCudaErrors(
       cudaMemcpy (&max_logLum, d_output, sizeof(float),
 		  cudaMemcpyDeviceToHost));
-
   checkCudaErrors(cudaFree (d_output));
+
+//  std::cout << "min: " << min_logLum << ", max: " << max_logLum << std::endl;
+
+  if (is_reference)
+    {
+      float *h_logLuminance = (float *) malloc (sizeof(float) * numPixels);
+      float h_output_max, h_output_min;
+      checkCudaErrors(
+	  cudaMemcpy (h_logLuminance, d_logLuminance, sizeof(float) * numPixels,
+		      cudaMemcpyDeviceToHost));
+
+      reduce_sequential (h_logLuminance, numPixels, h_output_min, true);
+      reduce_sequential (h_logLuminance, numPixels, h_output_max, false);
+
+      std::cout << "(reference) min: " << h_output_min << ", max: "
+	  << h_output_max << std::endl;
+    }
 }
 
 void
@@ -183,12 +215,25 @@ your_histogram_and_prefixsum (const float* const d_logLuminance,
    incoming d_cdf pointer which already has been allocated for you)       */
 
   const size_t numPixels = numRows * numCols;
-//  const size_t numPixels = 10000;
 
   // find the min/max
-  get_range (d_logLuminance, numPixels, min_logLum, max_logLum);
+  find_range (d_logLuminance, numPixels, min_logLum, max_logLum);
 
-  print_temp(d_logLuminance, numPixels);
+//  print_device_data (d_logLuminance, numPixels);
 
-  printf ("min: %lf, max: %lf", min_logLum, max_logLum);
 }
+
+void
+print_device_data (const float* const d_data, const size_t numElem)
+{
+  float *h_data = (float *) malloc (sizeof(float) * numElem);
+  checkCudaErrors(
+      cudaMemcpy (h_data, d_data, sizeof(float) * numElem,
+		  cudaMemcpyDeviceToHost));
+  for (int i = 0; i < numElem; i++)
+    {
+      std::cout << h_data[i] << " ";
+    }
+  std::cout << std::endl;
+}
+
