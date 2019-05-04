@@ -82,6 +82,21 @@
 #include "utils.h"
 #include "stdio.h"
 
+template<typename T>
+  void
+  print_device_data (const T* const d_data, const size_t numElem)
+  {
+    T *h_data = (T*) malloc (sizeof(T) * numElem);
+    checkCudaErrors(
+	cudaMemcpy (h_data, d_data, sizeof(T) * numElem,
+		    cudaMemcpyDeviceToHost));
+    for (int i = 0; i < numElem; i++)
+      {
+	std::cout << h_data[i] << " ";
+      }
+    std::cout << std::endl;
+  }
+
 __global__ void
 reduce_step (const float* const d_input, const int numPixels,
 	     float* const d_output, const int stride, const int n_threads,
@@ -118,6 +133,26 @@ reduce_step (const float* const d_input, const int numPixels,
 }
 
 void
+reduce_sequential (const float* const h_input, const size_t numPixels,
+		   float &h_output, const bool is_min)
+{
+  assert(numPixels > 0);
+
+  h_output = h_input[0];
+  for (int i = 1; i < numPixels; i++)
+    {
+      if (is_min)
+	{
+	  h_output = min (h_output, h_input[i]);
+	}
+      else
+	{
+	  h_output = max (h_output, h_input[i]);
+	}
+    }
+}
+
+void
 reduce (const float* const d_input, const size_t numPixels,
 	float* const d_output, const bool is_min)
 {
@@ -137,26 +172,6 @@ reduce (const float* const d_input, const size_t numPixels,
       reduce_step <<<gridSize, blockSize>>> (d_temp, numPixels, d_output,
 					     stride, n_threads, is_min);
       d_temp = d_output;
-    }
-}
-
-void
-reduce_sequential (const float* const h_input, const size_t numPixels,
-		   float &h_output, const bool is_min)
-{
-  assert(numPixels > 0);
-
-  h_output = h_input[0];
-  for (int i = 1; i < numPixels; i++)
-    {
-      if (is_min)
-	{
-	  h_output = min (h_output, h_input[i]);
-	}
-      else
-	{
-	  h_output = max (h_output, h_input[i]);
-	}
     }
 }
 
@@ -197,6 +212,40 @@ find_range (const float* const d_logLuminance, const size_t numPixels,
     }
 }
 
+__global__ void
+histogram (const float* const d_logLuminance, unsigned int* const d_histogram,
+	   const int numPixels, const int min_logLum, const int max_logLum,
+	   const int numBins)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx >= numPixels)
+    {
+      return;
+    }
+
+  const int bin = (d_logLuminance[idx] - min_logLum) / (max_logLum - min_logLum)
+      * numBins;
+  atomicAdd (&d_histogram[bin], 1);
+}
+
+unsigned int*
+get_histogram (const float* const d_logLuminance, const size_t numPixels,
+	       const float min_logLum, const float max_logLum,
+	       const size_t numBins)
+{
+  unsigned int* d_histogram;
+  checkCudaErrors(cudaMalloc (&d_histogram, sizeof(unsigned int) * numBins));
+
+  const dim3 blockSize (32 * 32);
+  const dim3 gridSize (numPixels / blockSize.x + 1);
+
+  histogram <<<gridSize, blockSize>>> (d_logLuminance, d_histogram, numPixels,
+				       min_logLum, max_logLum, numBins);
+
+  return d_histogram;
+}
+
 void
 your_histogram_and_prefixsum (const float* const d_logLuminance,
 			      unsigned int* const d_cdf, float &min_logLum,
@@ -218,22 +267,15 @@ your_histogram_and_prefixsum (const float* const d_logLuminance,
 
   // find the min/max
   find_range (d_logLuminance, numPixels, min_logLum, max_logLum);
+  //  print_device_data (d_logLuminance, numPixels);
 
-//  print_device_data (d_logLuminance, numPixels);
+  // get historgram
+  unsigned int* const d_histogram = get_histogram (d_logLuminance, numPixels,
+						   min_logLum, max_logLum,
+						   numBins);
+  print_device_data<unsigned int> (d_histogram, numBins);
 
-}
-
-void
-print_device_data (const float* const d_data, const size_t numElem)
-{
-  float *h_data = (float *) malloc (sizeof(float) * numElem);
-  checkCudaErrors(
-      cudaMemcpy (h_data, d_data, sizeof(float) * numElem,
-		  cudaMemcpyDeviceToHost));
-  for (int i = 0; i < numElem; i++)
-    {
-      std::cout << h_data[i] << " ";
-    }
-  std::cout << std::endl;
+  // cleanup
+  checkCudaErrors(cudaFree (d_histogram));
 }
 
