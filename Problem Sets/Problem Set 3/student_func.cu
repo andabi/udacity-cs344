@@ -251,7 +251,8 @@ get_histogram (const float* const d_logLuminance, const size_t numPixels,
 	{ };
       float *h_logLuminance = (float*) malloc (sizeof(float) * numPixels);
 
-      unsigned int *h_histogram = (unsigned int*) malloc (sizeof(unsigned int) * numBins);
+      unsigned int *h_histogram = (unsigned int*) malloc (
+	  sizeof(unsigned int) * numBins);
       checkCudaErrors(
 	  cudaMemcpy (h_histogram, d_histogram, sizeof(unsigned int) * numBins,
 		      cudaMemcpyDeviceToHost));
@@ -277,6 +278,31 @@ get_histogram (const float* const d_logLuminance, const size_t numPixels,
 }
 
 void
+compute_exclusive_scan (unsigned int* const d_histogram, const size_t numBins,
+			unsigned int* const d_cdf, bool is_reference)
+{
+  if (is_reference)
+    {
+      unsigned int* ref_histogram = (unsigned int*) malloc (
+	  sizeof(unsigned int) * numBins);
+      checkCudaErrors(
+	  cudaMemcpy (ref_histogram, d_histogram,
+		      sizeof(unsigned int) * numBins, cudaMemcpyDeviceToHost));
+
+      unsigned int ref_exclusive_scan[numBins] =
+	{ };
+      unsigned int sum = 0;
+      cout << "(reference)" << endl;
+      for (int i = 0; i < numBins; i++)
+	{
+	  ref_exclusive_scan[i] = sum;
+	  sum += ref_histogram[i];
+	  cout << ref_exclusive_scan[i] << " ";
+	}
+    }
+}
+
+void
 your_histogram_and_prefixsum (const float* const d_logLuminance,
 			      unsigned int* const d_cdf, float &min_logLum,
 			      float &max_logLum, const size_t numRows,
@@ -299,12 +325,14 @@ your_histogram_and_prefixsum (const float* const d_logLuminance,
   find_range (d_logLuminance, numPixels, min_logLum, max_logLum);
   //  print_device_data (d_logLuminance, numPixels);
 
-  // get historgram
+// get historgram
   unsigned int* const d_histogram = get_histogram (d_logLuminance, numPixels,
 						   min_logLum, max_logLum,
 						   numBins, false);
 //  print_device_data<unsigned int> (d_histogram, numBins);
 
+// exclusive scan
+  compute_exclusive_scan (d_histogram, numBins, d_cdf, true);
 
 // cleanup
   checkCudaErrors(cudaFree (d_histogram));
