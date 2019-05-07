@@ -82,6 +82,8 @@
 #include "utils.h"
 #include "stdio.h"
 
+using namespace std;
+
 template<typename T>
   void
   print_device_data (const T* const d_data, const size_t numElem)
@@ -90,11 +92,11 @@ template<typename T>
     checkCudaErrors(
 	cudaMemcpy (h_data, d_data, sizeof(T) * numElem,
 		    cudaMemcpyDeviceToHost));
-    for (int i = 0; i < numElem; i++)
+    for (size_t i = 0; i < numElem; i++)
       {
-	std::cout << h_data[i] << " ";
+	cout << h_data[i] << " ";
       }
-    std::cout << std::endl;
+    cout << endl;
   }
 
 __global__ void
@@ -139,7 +141,7 @@ reduce_sequential (const float* const h_input, const size_t numPixels,
   assert(numPixels > 0);
 
   h_output = h_input[0];
-  for (int i = 1; i < numPixels; i++)
+  for (size_t i = 1; i < numPixels; i++)
     {
       if (is_min)
 	{
@@ -194,7 +196,7 @@ find_range (const float* const d_logLuminance, const size_t numPixels,
 		  cudaMemcpyDeviceToHost));
   checkCudaErrors(cudaFree (d_output));
 
-//  std::cout << "min: " << min_logLum << ", max: " << max_logLum << std::endl;
+//  cout << "min: " << min_logLum << ", max: " << max_logLum << endl;
 
   if (is_reference)
     {
@@ -207,14 +209,14 @@ find_range (const float* const d_logLuminance, const size_t numPixels,
       reduce_sequential (h_logLuminance, numPixels, h_output_min, true);
       reduce_sequential (h_logLuminance, numPixels, h_output_max, false);
 
-      std::cout << "(reference) min: " << h_output_min << ", max: "
-	  << h_output_max << std::endl;
+      cout << "(reference) min: " << h_output_min << ", max: " << h_output_max
+	  << endl;
     }
 }
 
 __global__ void
 histogram (const float* const d_logLuminance, unsigned int* const d_histogram,
-	   const int numPixels, const int min_logLum, const int max_logLum,
+	   const int numPixels, const float min_logLum, const float max_logLum,
 	   const int numBins)
 {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -232,7 +234,7 @@ histogram (const float* const d_logLuminance, unsigned int* const d_histogram,
 unsigned int*
 get_histogram (const float* const d_logLuminance, const size_t numPixels,
 	       const float min_logLum, const float max_logLum,
-	       const size_t numBins)
+	       const size_t numBins, bool is_reference = false)
 {
   unsigned int* d_histogram;
   checkCudaErrors(cudaMalloc (&d_histogram, sizeof(unsigned int) * numBins));
@@ -242,6 +244,34 @@ get_histogram (const float* const d_logLuminance, const size_t numPixels,
 
   histogram <<<gridSize, blockSize>>> (d_logLuminance, d_histogram, numPixels,
 				       min_logLum, max_logLum, numBins);
+
+  if (is_reference)
+    {
+      size_t ref_histogram[numBins] =
+	{ };
+      float *h_logLuminance = (float*) malloc (sizeof(float) * numPixels);
+
+      unsigned int *h_histogram = (unsigned int*) malloc (sizeof(unsigned int) * numBins);
+      checkCudaErrors(
+	  cudaMemcpy (h_histogram, d_histogram, sizeof(unsigned int) * numBins,
+		      cudaMemcpyDeviceToHost));
+
+      checkCudaErrors(
+	  cudaMemcpy (h_logLuminance, d_logLuminance, sizeof(float) * numPixels,
+		      cudaMemcpyDeviceToHost));
+      for (size_t i = 0; i < numPixels; i++)
+	{
+	  int bin = (h_logLuminance[i] - min_logLum) / (max_logLum - min_logLum)
+	      * numBins;
+	  ref_histogram[bin] += 1;
+	}
+      cout << "(reference)" << endl;
+      for (size_t i = 0; i < numBins; i++)
+	{
+	  cout << ref_histogram[i] << " (" << h_histogram[i] << "), ";
+	}
+      cout << endl;
+    }
 
   return d_histogram;
 }
@@ -272,10 +302,11 @@ your_histogram_and_prefixsum (const float* const d_logLuminance,
   // get historgram
   unsigned int* const d_histogram = get_histogram (d_logLuminance, numPixels,
 						   min_logLum, max_logLum,
-						   numBins);
-  print_device_data<unsigned int> (d_histogram, numBins);
+						   numBins, false);
+//  print_device_data<unsigned int> (d_histogram, numBins);
 
-  // cleanup
+
+// cleanup
   checkCudaErrors(cudaFree (d_histogram));
 }
 
