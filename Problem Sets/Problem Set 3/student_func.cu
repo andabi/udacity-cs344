@@ -277,10 +277,83 @@ get_histogram (const float* const d_logLuminance, const size_t numPixels,
   return d_histogram;
 }
 
+__global__ void
+init_scan (unsigned int* const d_histogram, unsigned int numBins,
+	   unsigned int* const d_temp)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numBins)
+    {
+      return;
+    }
+  d_temp[idx] = d_histogram[idx];
+}
+
+__global__ void
+copy_scan (unsigned int* const d_temp, unsigned int* const d_cdf,
+	   unsigned int numBins)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < numBins)
+    {
+      d_cdf[idx] = d_temp[idx];
+    }
+}
+
+__global__ void
+reduce_scan (unsigned int* const d_input, unsigned int numElem, int stride,
+	     int numThreads)
+{
+  const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (thread_idx >= numThreads)
+    {
+      return;
+    }
+  const int idx = stride * thread_idx + (stride - 1);
+  d_input[idx] += d_input[idx - stride / 2];
+}
+
+__global__ void
+downswipe_scan (unsigned int* const d_input, unsigned int numElem, int stride,
+		int numThreads)
+{
+  int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (thread_idx >= numThreads)
+    {
+      return;
+    }
+  thread_idx = numThreads - thread_idx - 1;
+  const int idx = numElem - 2 * stride * thread_idx - 1;
+  unsigned int left = d_input[idx - stride], right = d_input[idx];
+  d_input[idx - stride] = right;
+  d_input[idx] = left + right;
+}
+
 void
 compute_exclusive_scan (unsigned int* const d_histogram, const size_t numBins,
 			unsigned int* const d_cdf, bool is_reference)
 {
+  // initialize d_cdf
+  dim3 blockSize (32);
+  dim3 gridSize (numBins / blockSize.x + 1);
+  init_scan <<<gridSize, blockSize>>> (d_histogram, numBins, d_cdf);
+
+  // Blelloch exclusive scan
+  int numSteps = log2 ((float) numBins);
+  for (int i = 0; i < numSteps; i++)
+    {
+      int numThreads = pow (2, numSteps - i - 1);
+      int stride = pow (2, i + 1);
+      reduce_scan <<<1, numThreads>>> (d_cdf, numBins, stride, numThreads);
+    }
+  checkCudaErrors(cudaMemset (&d_cdf[numBins - 1], 0, sizeof(unsigned int)));
+  for (int i = 0; i < numSteps; i++)
+    {
+      int numThreads = pow (2, i);
+      int stride = pow (2, numSteps - i - 1);
+      downswipe_scan <<<1, numThreads>>> (d_cdf, numBins, stride, numThreads);
+    }
+
   if (is_reference)
     {
       unsigned int* ref_histogram = (unsigned int*) malloc (
@@ -293,12 +366,13 @@ compute_exclusive_scan (unsigned int* const d_histogram, const size_t numBins,
 	{ };
       unsigned int sum = 0;
       cout << "(reference)" << endl;
-      for (int i = 0; i < numBins; i++)
+      for (size_t i = 0; i < numBins; i++)
 	{
 	  ref_exclusive_scan[i] = sum;
 	  sum += ref_histogram[i];
 	  cout << ref_exclusive_scan[i] << " ";
 	}
+      cout << endl;
     }
 }
 
@@ -323,16 +397,14 @@ your_histogram_and_prefixsum (const float* const d_logLuminance,
 
   // find the min/max
   find_range (d_logLuminance, numPixels, min_logLum, max_logLum);
-  //  print_device_data (d_logLuminance, numPixels);
 
 // get historgram
   unsigned int* const d_histogram = get_histogram (d_logLuminance, numPixels,
 						   min_logLum, max_logLum,
 						   numBins, false);
-//  print_device_data<unsigned int> (d_histogram, numBins);
-
 // exclusive scan
-  compute_exclusive_scan (d_histogram, numBins, d_cdf, true);
+  compute_exclusive_scan (d_histogram, numBins, d_cdf, false);
+//  print_device_data<unsigned int> (d_cdf, numBins);
 
 // cleanup
   checkCudaErrors(cudaFree (d_histogram));
