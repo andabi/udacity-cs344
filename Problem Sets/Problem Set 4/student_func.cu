@@ -71,7 +71,7 @@ histogram (unsigned int* const d_inputVals, const unsigned int numPixels,
       return;
     }
 
-  const int n_iter = sizeof(int) / bits;
+  const int n_iter = sizeof(int) * CHAR_BIT / bits;
   const int bin = d_inputVals[idx] << ((n_iter - idx_iter - 1) * bits)
       >> ((n_iter - 1) * bits);
 
@@ -83,7 +83,7 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
 	       const int bits, const size_t idx_iter, bool is_reference = false)
 {
   const int numBins = pow (2, bits);
-  const int n_iter = sizeof(int) / bits;
+  const int n_iter = sizeof(int) * CHAR_BIT / bits;
 
   unsigned int* d_histogram;
   checkCudaErrors(cudaMalloc (&d_histogram, sizeof(unsigned int) * numBins));
@@ -98,19 +98,21 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
     {
       size_t ref_histogram[numBins] =
 	{ };
-      unsigned int *h_histogram = (unsigned int*) malloc (sizeof(unsigned int) * numBins);
+      unsigned int *h_histogram = (unsigned int*) malloc (
+	  sizeof(unsigned int) * numBins);
       checkCudaErrors(
 	  cudaMemcpy (h_histogram, d_histogram, sizeof(unsigned int) * numBins,
 		      cudaMemcpyDeviceToHost));
 
-      unsigned int *h_inputVals = (unsigned int*) malloc (sizeof(unsigned int) * numPixels);
+      unsigned int *h_inputVals = (unsigned int*) malloc (
+	  sizeof(unsigned int) * numPixels);
       checkCudaErrors(
-	  cudaMemcpy (h_inputVals, d_inputVals, sizeof(float) * numPixels,
+	  cudaMemcpy (h_inputVals, d_inputVals, sizeof(unsigned int) * numPixels,
 		      cudaMemcpyDeviceToHost));
       for (size_t i = 0; i < numPixels; i++)
 	{
 
-	  int bin = d_inputVals[i] << ((n_iter - idx_iter - 1) * bits)
+	  int bin = h_inputVals[i] << ((n_iter - idx_iter - 1) * bits)
 	      >> ((n_iter - 1) * bits);
 	  assert(bin < numBins);
 	  ref_histogram[bin] += 1;
@@ -234,12 +236,16 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
 
   // get index
   //// get abs pos
-  const unsigned int *d_histogram = get_histogram (d_inputVals, numElems,
-						   N_BITS, 0, true);
+  unsigned int *d_histogram = get_histogram (d_inputVals, numElems, N_BITS, 0,
+					     true);
 //  print_device_data<unsigned int>(d_inputPos, numElems);
 
   //// get rel pos
 
   // scatter, iterations
   // make sure copy to output buffer
+
+  // cleanup
+  checkCudaErrors(cudaFree (d_histogram));
+
 }
