@@ -280,7 +280,6 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
   checkCudaErrors(cudaMalloc (&d_absPos, sizeof(unsigned int) * numBins));
   get_absPos (d_inputVals, numElems, d_absPos, numBins, idx_iter, N_BITS);
 
-  //// get rel pos
   unsigned int *d_relPos;
   checkCudaErrors(cudaMalloc (&d_relPos, sizeof(unsigned int) * numElems));
   get_relPos (d_inputVals, numElems, d_relPos, numBins, idx_iter, N_BITS);
@@ -288,7 +287,10 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
   // scatter, iterations
   // make sure copy to output buffer
 
+  // get absPos and get relPos could be done in parallel using Stream
+
   // cleanup
   checkCudaErrors(cudaFree (d_absPos));
+  checkCudaErrors(cudaFree (d_relPos));
 
 }
