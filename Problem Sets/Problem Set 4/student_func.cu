@@ -59,6 +59,15 @@ template<typename T>
     cout << endl;
   }
 
+__host__ __device__ int
+get_bin (unsigned int value, int idx_iter, const int bits)
+{
+  const int n_iter = sizeof(int) * CHAR_BIT / bits;
+  const int bin = value << ((n_iter - idx_iter - 1) * bits)
+      >> ((n_iter - 1) * bits);
+  return bin;
+}
+
 __global__ void
 histogram (unsigned int* const d_inputVals, const unsigned int numPixels,
 	   unsigned int* const d_histogram, const int bits,
@@ -71,28 +80,23 @@ histogram (unsigned int* const d_inputVals, const unsigned int numPixels,
       return;
     }
 
-  const int n_iter = sizeof(int) * CHAR_BIT / bits;
-  const int bin = d_inputVals[idx] << ((n_iter - idx_iter - 1) * bits)
-      >> ((n_iter - 1) * bits);
+  const int bin = get_bin (d_inputVals[idx], idx_iter, bits);
 
   atomicAdd (&d_histogram[bin], 1);
 }
 
 unsigned int*
 get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
-	       const int bits, const size_t idx_iter, bool is_reference = false)
+	       unsigned int* d_absPos, const size_t idx_iter, const int bits,
+	       bool is_reference = false)
 {
   const int numBins = pow (2, bits);
-  const int n_iter = sizeof(int) * CHAR_BIT / bits;
-
-  unsigned int* d_histogram;
-  checkCudaErrors(cudaMalloc (&d_histogram, sizeof(unsigned int) * numBins));
 
   const dim3 blockSize (32 * 32);
   const dim3 gridSize (numPixels / blockSize.x + 1);
 
-  histogram <<<gridSize, blockSize>>> (d_inputVals, numPixels, d_histogram,
-				       bits, idx_iter);
+  histogram <<<gridSize, blockSize>>> (d_inputVals, numPixels, d_absPos, bits,
+				       idx_iter);
 
   if (is_reference)
     {
@@ -101,7 +105,7 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
       unsigned int *h_histogram = (unsigned int*) malloc (
 	  sizeof(unsigned int) * numBins);
       checkCudaErrors(
-	  cudaMemcpy (h_histogram, d_histogram, sizeof(unsigned int) * numBins,
+	  cudaMemcpy (h_histogram, d_absPos, sizeof(unsigned int) * numBins,
 		      cudaMemcpyDeviceToHost));
 
       unsigned int *h_inputVals = (unsigned int*) malloc (
@@ -112,10 +116,7 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
 		      cudaMemcpyDeviceToHost));
       for (size_t i = 0; i < numPixels; i++)
 	{
-
-	  int bin = h_inputVals[i] << ((n_iter - idx_iter - 1) * bits)
-	      >> ((n_iter - 1) * bits);
-	  assert(bin < numBins);
+	  int bin = get_bin (h_inputVals[i], idx_iter, bits);
 	  ref_histogram[bin] += 1;
 	}
       cout << "(reference)" << endl;
@@ -126,7 +127,7 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
       cout << endl;
     }
 
-  return d_histogram;
+  return d_absPos;
 }
 
 __global__ void
@@ -217,7 +218,40 @@ compute_exclusive_scan_sequantially (unsigned int* data, const size_t numBins)
 	  scaned_data[i] = scaned_data[i - 1] + data[i - 1];
 	}
     }
-    data = scaned_data;
+  data = scaned_data;
+}
+
+void
+__global__
+apply_mask (unsigned int* const d_inputVals, const unsigned int numElems,
+	    bool* d_mask, const int numBins, const int idx_iter, const int bits)
+{
+  const int idx_elem = blockIdx.x * blockDim.x + threadIdx.x;
+  const int idx_bin = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (idx_bin >= numBins || idx_elem >= numElems)
+    {
+      return;
+    }
+
+  int bin = get_bin (d_inputVals[idx_elem], idx_iter, bits);
+  if (bin == idx_bin)
+    {
+      d_mask[idx_elem * numBins + idx_bin] = true;
+    }
+}
+
+void
+get_relPos (unsigned int* const d_inputVals, const size_t numElems,
+	    unsigned int* d_relPos, const int numBins, int idx_iter, int bits)
+{
+  bool* d_mask;
+  checkCudaErrors(cudaMalloc (&d_mask, sizeof(bool) * numElems * numBins));
+  const dim3 blockSize (32, 32);
+  const dim3 gridSize (numElems / blockSize.x + 1, numBins / blockSize.y + 1);
+
+  apply_mask <<<gridSize, blockSize>>> (d_inputVals, numElems, d_mask, numBins,
+					idx_iter, bits);
 }
 
 void
@@ -226,20 +260,27 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
 	   const size_t numElems)
 {
   const int N_BITS = 4;
+  const int numBins = pow (2, N_BITS);
+
+  int idx_iter = 0;
 
   // get index
   //// get abs pos
-  unsigned int *d_histogram = get_histogram (d_inputVals, numElems, N_BITS, 0,
-					     false);
+  unsigned int *d_absPos;
+  checkCudaErrors(cudaMalloc (&d_absPos, sizeof(unsigned int) * numBins));
 
-  compute_exclusive_scan (d_histogram, pow (2, N_BITS));
+  get_histogram (d_inputVals, numElems, d_absPos, idx_iter, N_BITS, false);
+  compute_exclusive_scan (d_absPos, numBins);
 
   //// get rel pos
+  unsigned int *d_relPos;
+  checkCudaErrors(cudaMalloc (&d_relPos, sizeof(unsigned int) * numElems));
+  get_relPos (d_inputVals, numElems, d_relPos, numBins, idx_iter, N_BITS);
 
   // scatter, iterations
   // make sure copy to output buffer
 
   // cleanup
-  checkCudaErrors(cudaFree (d_histogram));
+  checkCudaErrors(cudaFree (d_absPos));
 
 }
