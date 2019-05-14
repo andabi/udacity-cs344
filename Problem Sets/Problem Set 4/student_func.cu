@@ -242,6 +242,14 @@ apply_mask (unsigned int* const d_inputVals, const unsigned int numElems,
 }
 
 void
+get_absPos (unsigned int* const d_inputVals, const size_t numElems,
+	    unsigned int* d_absPos, const int numBins, int idx_iter, int bits)
+{
+  get_histogram (d_inputVals, numElems, d_absPos, idx_iter, bits, false);
+  compute_exclusive_scan (d_absPos, numBins);
+}
+
+void
 get_relPos (unsigned int* const d_inputVals, const size_t numElems,
 	    unsigned int* d_relPos, const int numBins, int idx_iter, int bits)
 {
@@ -252,6 +260,10 @@ get_relPos (unsigned int* const d_inputVals, const size_t numElems,
 
   apply_mask <<<gridSize, blockSize>>> (d_inputVals, numElems, d_mask, numBins,
 					idx_iter, bits);
+
+  // segmented exclusive scan
+
+  // sequaltially add
 }
 
 void
@@ -264,13 +276,9 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
 
   int idx_iter = 0;
 
-  // get index
-  //// get abs pos
   unsigned int *d_absPos;
   checkCudaErrors(cudaMalloc (&d_absPos, sizeof(unsigned int) * numBins));
-
-  get_histogram (d_inputVals, numElems, d_absPos, idx_iter, N_BITS, false);
-  compute_exclusive_scan (d_absPos, numBins);
+  get_absPos (d_inputVals, numElems, d_absPos, numBins, idx_iter, N_BITS);
 
   //// get rel pos
   unsigned int *d_relPos;
