@@ -155,60 +155,89 @@ copy_scan (unsigned int* const d_temp, unsigned int* const d_cdf,
 
 __global__ void
 reduce_scan (unsigned int* const d_input, unsigned int numElem, int stride,
-	     int numThreads)
+	     int numThreads, int numSegs)
 {
-  const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (thread_idx >= numThreads)
+  const int idx_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const int idx_seg = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (idx_thread >= numThreads || idx_seg >= numSegs)
     {
       return;
     }
-  const int idx = stride * thread_idx + (stride - 1);
-  d_input[idx] += d_input[idx - stride / 2];
+
+  const int idx = stride * idx_thread + (stride - 1);
+  d_input[idx * numSegs + idx_seg] += d_input[(idx - stride / 2) * numSegs
+      + idx_seg];
 }
 
 __global__ void
 downswipe_scan (unsigned int* const d_input, unsigned int numElem, int stride,
-		int numThreads)
+		int numThreads, int numSegs)
 {
-  int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (thread_idx >= numThreads)
+  const int idx_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const int idx_seg = blockIdx.y + blockDim.y + threadIdx.y;
+
+  if (idx_thread >= numThreads || idx_seg >= numSegs)
     {
       return;
     }
-  thread_idx = numThreads - thread_idx - 1;
-  const int idx = numElem - 2 * stride * thread_idx - 1;
-  unsigned int left = d_input[idx - stride], right = d_input[idx];
-  d_input[idx - stride] = right;
-  d_input[idx] = left + right;
+  const int inverse_idx_thread = numThreads - idx_thread - 1;
+  const int idx = numElem - 2 * stride * inverse_idx_thread - 1;
+
+  unsigned int left = d_input[(idx - stride) * numSegs + idx_seg];
+  unsigned int right = d_input[idx * numSegs + idx_seg];
+
+  d_input[(idx - stride) * numSegs + idx_seg] = right;
+  d_input[idx * numSegs + idx_seg] = left + right;
+}
+
+__global__ void
+set_zero_last (unsigned int* const d_data, const size_t numElems,
+	       const int numSegs)
+{
+  const int idx_seg = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx_seg >= numSegs)
+    {
+      return;
+    }
+
+  d_data[(numElems - 1) * numSegs + idx_seg] = 0;
 }
 
 void
-compute_exclusive_scan (unsigned int* const d_data, const size_t numBins)
+segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
+			  const int numSegs = 1)
 {
-//  // initialize d_cdf
-//  dim3 blockSize (32);
-//  dim3 gridSize (numBins / blockSize.x + 1);
-//  init_scan <<<gridSize, blockSize>>> (d_histogram, numBins, d_cdf);
-
 // Blelloch exclusive scan
-  int numSteps = log2 ((float) numBins);
+  int numSteps = log2 ((float) numElems);
   for (int i = 0; i < numSteps; i++)
     {
       int numThreads = pow (2, numSteps - i - 1);
       int stride = pow (2, i + 1);
-      reduce_scan <<<1, numThreads>>> (d_data, numBins, stride, numThreads);
+
+      dim3 blockSize (32, 32);
+      dim3 gridSize (numThreads / blockSize.x + 1, numSegs / blockSize.y + 1);
+      reduce_scan <<<gridSize, blockSize>>> (d_data, numElems, stride,
+					     numThreads, numSegs);
     }
-  checkCudaErrors(cudaMemset (&d_data[numBins - 1], 0, sizeof(unsigned int)));
+
+  set_zero_last <<<numSegs / 32 + 1, 32>>> (d_data, numElems, numSegs);
+
   for (int i = 0; i < numSteps; i++)
     {
       int numThreads = pow (2, i);
       int stride = pow (2, numSteps - i - 1);
-      downswipe_scan <<<1, numThreads>>> (d_data, numBins, stride, numThreads);
+
+      dim3 blockSize (32, 32);
+      dim3 gridSize (numThreads / blockSize.x + 1, numSegs / blockSize.y + 1);
+      downswipe_scan <<<gridSize, blockSize>>> (d_data, numElems, stride,
+						numThreads, numSegs);
     }
 }
 
 void
-compute_exclusive_scan_sequantially (unsigned int* data, const size_t numBins)
+exclusive_scan_sequantially (unsigned int* data, const size_t numBins)
 {
   unsigned int scaned_data[numBins] =
     { };
@@ -223,47 +252,83 @@ compute_exclusive_scan_sequantially (unsigned int* data, const size_t numBins)
 
 void
 __global__
-apply_mask (unsigned int* const d_inputVals, const unsigned int numElems,
-	    bool* d_mask, const int numBins, const int idx_iter, const int bits)
+segmented_mask (unsigned int* const d_inputVals, const unsigned int numElems,
+		unsigned int* d_mask, const int numSegs, const int idx_iter,
+		const int bits)
 {
   const int idx_elem = blockIdx.x * blockDim.x + threadIdx.x;
-  const int idx_bin = blockIdx.y * blockDim.y + threadIdx.y;
+  const int idx_seg = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if (idx_bin >= numBins || idx_elem >= numElems)
+  if (idx_seg >= numSegs || idx_elem >= numElems)
     {
       return;
     }
 
   int bin = get_bin (d_inputVals[idx_elem], idx_iter, bits);
-  if (bin == idx_bin)
+  if (bin == idx_seg)
     {
-      d_mask[idx_elem * numBins + idx_bin] = true;
+      d_mask[idx_elem * numSegs + idx_seg] = true;
     }
+}
+
+__global__ void
+merge_segments (unsigned int* const d_input, unsigned int* const d_mask, const int numElems,
+		unsigned int* const d_output, const int numSegs)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx >= numElems)
+    {
+      return;
+    }
+
+  int sum = 0;
+  for (int i = 0; i < numSegs; i++)
+    {
+      sum += d_input[idx * numSegs + i] * d_mask[idx * numSegs + i];
+    }
+  d_output[idx] = sum;
 }
 
 void
 get_absPos (unsigned int* const d_inputVals, const size_t numElems,
 	    unsigned int* d_absPos, const int numBins, int idx_iter, int bits)
 {
-  get_histogram (d_inputVals, numElems, d_absPos, idx_iter, bits, false);
-  compute_exclusive_scan (d_absPos, numBins);
+  get_histogram (d_inputVals, numElems, d_absPos, idx_iter, bits);
+  segmented_exclusive_scan (d_absPos, numBins, 1);
 }
 
 void
 get_relPos (unsigned int* const d_inputVals, const size_t numElems,
 	    unsigned int* d_relPos, const int numBins, int idx_iter, int bits)
 {
-  bool* d_mask;
-  checkCudaErrors(cudaMalloc (&d_mask, sizeof(bool) * numElems * numBins));
   const dim3 blockSize (32, 32);
   const dim3 gridSize (numElems / blockSize.x + 1, numBins / blockSize.y + 1);
 
-  apply_mask <<<gridSize, blockSize>>> (d_inputVals, numElems, d_mask, numBins,
-					idx_iter, bits);
+  // make mask
+  unsigned int* d_mask;
+  checkCudaErrors(
+      cudaMalloc (&d_mask, sizeof(unsigned int) * numElems * numBins));
+  segmented_mask <<<gridSize, blockSize>>> (d_inputVals, numElems, d_mask,
+					    numBins, idx_iter, bits);
+//  print_device_data<unsigned int>(d_mask, numElems * numBins);
 
-  // segmented exclusive scan
+// segmented exclusive scan
+  unsigned int* d_exclusive_scan;
+  checkCudaErrors(
+      cudaMalloc (&d_exclusive_scan,
+		  sizeof(unsigned int) * numElems * numBins));
+  checkCudaErrors(
+      cudaMemcpy (d_exclusive_scan, d_mask,
+		  sizeof(unsigned int) * numElems * numBins,
+		  cudaMemcpyDeviceToDevice));
+// FIXME: segmented_exclusive_scan. where input size is not power of 2.
+//  segmented_exclusive_scan (d_exclusive_scan, numElems, numBins);
+//  print_device_data<unsigned int> (d_exclusive_scan, numElems);
 
-  // sequaltially add
+  merge_segments <<<numElems / 32 + 1, 32>>> (d_exclusive_scan, d_mask, numElems,
+					      d_relPos, numBins);
+  print_device_data<unsigned int> (d_relPos, numElems);
 }
 
 void
