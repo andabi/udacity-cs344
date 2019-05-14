@@ -107,7 +107,8 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
       unsigned int *h_inputVals = (unsigned int*) malloc (
 	  sizeof(unsigned int) * numPixels);
       checkCudaErrors(
-	  cudaMemcpy (h_inputVals, d_inputVals, sizeof(unsigned int) * numPixels,
+	  cudaMemcpy (h_inputVals, d_inputVals,
+		      sizeof(unsigned int) * numPixels,
 		      cudaMemcpyDeviceToHost));
       for (size_t i = 0; i < numPixels; i++)
 	{
@@ -181,50 +182,42 @@ downswipe_scan (unsigned int* const d_input, unsigned int numElem, int stride,
 }
 
 void
-compute_exclusive_scan (unsigned int* const d_histogram, const size_t numBins,
-			unsigned int* const d_cdf, bool is_reference)
+compute_exclusive_scan (unsigned int* const d_data, const size_t numBins)
 {
-  // initialize d_cdf
-  dim3 blockSize (32);
-  dim3 gridSize (numBins / blockSize.x + 1);
-  init_scan <<<gridSize, blockSize>>> (d_histogram, numBins, d_cdf);
+//  // initialize d_cdf
+//  dim3 blockSize (32);
+//  dim3 gridSize (numBins / blockSize.x + 1);
+//  init_scan <<<gridSize, blockSize>>> (d_histogram, numBins, d_cdf);
 
-  // Blelloch exclusive scan
+// Blelloch exclusive scan
   int numSteps = log2 ((float) numBins);
   for (int i = 0; i < numSteps; i++)
     {
       int numThreads = pow (2, numSteps - i - 1);
       int stride = pow (2, i + 1);
-      reduce_scan <<<1, numThreads>>> (d_cdf, numBins, stride, numThreads);
+      reduce_scan <<<1, numThreads>>> (d_data, numBins, stride, numThreads);
     }
-  checkCudaErrors(cudaMemset (&d_cdf[numBins - 1], 0, sizeof(unsigned int)));
+  checkCudaErrors(cudaMemset (&d_data[numBins - 1], 0, sizeof(unsigned int)));
   for (int i = 0; i < numSteps; i++)
     {
       int numThreads = pow (2, i);
       int stride = pow (2, numSteps - i - 1);
-      downswipe_scan <<<1, numThreads>>> (d_cdf, numBins, stride, numThreads);
+      downswipe_scan <<<1, numThreads>>> (d_data, numBins, stride, numThreads);
     }
+}
 
-  if (is_reference)
+void
+compute_exclusive_scan_sequantially (unsigned int* data, const size_t numBins)
+{
+  unsigned int scaned_data[numBins] =
+    { };
     {
-      unsigned int* ref_histogram = (unsigned int*) malloc (
-	  sizeof(unsigned int) * numBins);
-      checkCudaErrors(
-	  cudaMemcpy (ref_histogram, d_histogram,
-		      sizeof(unsigned int) * numBins, cudaMemcpyDeviceToHost));
-
-      unsigned int ref_exclusive_scan[numBins] =
-	{ };
-      unsigned int sum = 0;
-      cout << "(reference)" << endl;
-      for (size_t i = 0; i < numBins; i++)
+      for (size_t i = 1; i < numBins; i++)
 	{
-	  ref_exclusive_scan[i] = sum;
-	  sum += ref_histogram[i];
-	  cout << ref_exclusive_scan[i] << " ";
+	  scaned_data[i] = scaned_data[i - 1] + data[i - 1];
 	}
-      cout << endl;
     }
+    data = scaned_data;
 }
 
 void
@@ -237,8 +230,9 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
   // get index
   //// get abs pos
   unsigned int *d_histogram = get_histogram (d_inputVals, numElems, N_BITS, 0,
-					     true);
-//  print_device_data<unsigned int>(d_inputPos, numElems);
+					     false);
+
+  compute_exclusive_scan (d_histogram, pow (2, N_BITS));
 
   //// get rel pos
 
