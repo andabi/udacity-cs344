@@ -175,12 +175,13 @@ downswipe_scan (unsigned int* const d_input, unsigned int numElem, int stride,
 		int numThreads, int numSegs)
 {
   const int idx_thread = blockIdx.x * blockDim.x + threadIdx.x;
-  const int idx_seg = blockIdx.y + blockDim.y + threadIdx.y;
+  const int idx_seg = blockIdx.y * blockDim.y + threadIdx.y;
 
   if (idx_thread >= numThreads || idx_seg >= numSegs)
     {
       return;
     }
+
   const int inverse_idx_thread = numThreads - idx_thread - 1;
   const int idx = numElem - 2 * stride * inverse_idx_thread - 1;
 
@@ -191,24 +192,13 @@ downswipe_scan (unsigned int* const d_input, unsigned int numElem, int stride,
   d_input[idx * numSegs + idx_seg] = left + right;
 }
 
-__global__ void
-set_zero_last (unsigned int* const d_data, const size_t numElems,
-	       const int numSegs)
-{
-  const int idx_seg = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (idx_seg >= numSegs)
-    {
-      return;
-    }
-
-  d_data[(numElems - 1) * numSegs + idx_seg] = 0;
-}
 
 void
 segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
 			  const int numSegs = 1)
 {
+  assert((numElems & (numElems - 1)) == 0); //numElems must be power of 2;
+
 // Blelloch exclusive scan
   int numSteps = log2 ((float) numElems);
   for (int i = 0; i < numSteps; i++)
@@ -222,7 +212,9 @@ segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
 					     numThreads, numSegs);
     }
 
-  set_zero_last <<<numSegs / 32 + 1, 32>>> (d_data, numElems, numSegs);
+  checkCudaErrors(
+      cudaMemset (d_data + (numElems-1) * numSegs, 0,
+		  sizeof(unsigned int) * numSegs));
 
   for (int i = 0; i < numSteps; i++)
     {
@@ -237,17 +229,17 @@ segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
 }
 
 void
-exclusive_scan_sequantially (unsigned int* data, const size_t numBins)
+exclusive_scan_sequantially (unsigned int* data, const size_t numElems)
 {
-  unsigned int scaned_data[numBins] =
+  unsigned int scanned_data[numElems] =
     { };
     {
-      for (size_t i = 1; i < numBins; i++)
+      for (size_t i = 1; i < numElems; i++)
 	{
-	  scaned_data[i] = scaned_data[i - 1] + data[i - 1];
+	  scanned_data[i] = scanned_data[i - 1] + data[i - 1];
 	}
     }
-  data = scaned_data;
+  data = scanned_data;
 }
 
 void
@@ -272,8 +264,9 @@ segmented_mask (unsigned int* const d_inputVals, const unsigned int numElems,
 }
 
 __global__ void
-merge_segments (unsigned int* const d_input, unsigned int* const d_mask, const int numElems,
-		unsigned int* const d_output, const int numSegs)
+merge_segments (unsigned int* const d_input, unsigned int* const d_mask,
+		const int numElems, unsigned int* const d_output,
+		const int numSegs)
 {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -300,35 +293,33 @@ get_absPos (unsigned int* const d_inputVals, const size_t numElems,
 
 void
 get_relPos (unsigned int* const d_inputVals, const size_t numElems,
-	    unsigned int* d_relPos, const int numBins, int idx_iter, int bits)
+	    unsigned int* d_relPos, int numBins, int idx_iter, int bits)
 {
   const dim3 blockSize (32, 32);
   const dim3 gridSize (numElems / blockSize.x + 1, numBins / blockSize.y + 1);
 
-  // make mask
+  // build mask
   unsigned int* d_mask;
   checkCudaErrors(
       cudaMalloc (&d_mask, sizeof(unsigned int) * numElems * numBins));
   segmented_mask <<<gridSize, blockSize>>> (d_inputVals, numElems, d_mask,
 					    numBins, idx_iter, bits);
-//  print_device_data<unsigned int>(d_mask, numElems * numBins);
 
-// segmented exclusive scan
-  unsigned int* d_exclusive_scan;
+  // segmented exclusive scan
+  unsigned int* d_scan;
+  int padding = pow (2, (int) (log2 ((float) numElems)) + 1) - numElems;
+  int padded_numElems = padding + numElems;
+
+  checkCudaErrors(cudaMalloc (&d_scan, sizeof(unsigned int) * padded_numElems * numBins));
   checkCudaErrors(
-      cudaMalloc (&d_exclusive_scan,
-		  sizeof(unsigned int) * numElems * numBins));
-  checkCudaErrors(
-      cudaMemcpy (d_exclusive_scan, d_mask,
-		  sizeof(unsigned int) * numElems * numBins,
+      cudaMemcpy (d_scan, d_mask, sizeof(unsigned int) * numElems * numBins,
 		  cudaMemcpyDeviceToDevice));
-// FIXME: segmented_exclusive_scan. where input size is not power of 2.
-//  segmented_exclusive_scan (d_exclusive_scan, numElems, numBins);
-//  print_device_data<unsigned int> (d_exclusive_scan, numElems);
 
-  merge_segments <<<numElems / 32 + 1, 32>>> (d_exclusive_scan, d_mask, numElems,
-					      d_relPos, numBins);
-  print_device_data<unsigned int> (d_relPos, numElems);
+  segmented_exclusive_scan (d_scan, padded_numElems, numBins);
+
+  // merge segments
+  merge_segments <<<numElems / 32 + 1, 32>>> (d_scan, d_mask,
+					      numElems, d_relPos, numBins);
 }
 
 void
