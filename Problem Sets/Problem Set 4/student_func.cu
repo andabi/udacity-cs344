@@ -46,7 +46,7 @@ using namespace std;
 
 template<typename T>
   void
-  print_device_data (const T* const d_data, const size_t numElem)
+  dprint (const T* const d_data, const size_t numElem)
   {
     T *h_data = (T*) malloc (sizeof(T) * numElem);
     checkCudaErrors(
@@ -90,7 +90,7 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
 	       unsigned int* d_absPos, const size_t idx_iter, const int bits,
 	       bool is_reference = false)
 {
-  const int numBins = pow (2, bits);
+  const unsigned int numBins = pow (2, bits);
 
   const dim3 blockSize (32 * 32);
   const dim3 gridSize (numPixels / blockSize.x + 1);
@@ -117,6 +117,7 @@ get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
       for (size_t i = 0; i < numPixels; i++)
 	{
 	  int bin = get_bin (h_inputVals[i], idx_iter, bits);
+	  assert(bin < numBins);
 	  ref_histogram[bin] += 1;
 	}
       cout << "(reference)" << endl;
@@ -192,7 +193,6 @@ downswipe_scan (unsigned int* const d_input, unsigned int numElem, int stride,
   d_input[idx * numSegs + idx_seg] = left + right;
 }
 
-
 void
 segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
 			  const int numSegs = 1)
@@ -213,7 +213,7 @@ segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
     }
 
   checkCudaErrors(
-      cudaMemset (d_data + (numElems-1) * numSegs, 0,
+      cudaMemset (d_data + (numElems - 1) * numSegs, 0,
 		  sizeof(unsigned int) * numSegs));
 
   for (int i = 0; i < numSteps; i++)
@@ -285,7 +285,8 @@ merge_segments (unsigned int* const d_input, unsigned int* const d_mask,
 
 void
 get_absPos (unsigned int* const d_inputVals, const size_t numElems,
-	    unsigned int* d_absPos, const int numBins, int idx_iter, int bits)
+	    unsigned int* d_absPos, const size_t numBins, int idx_iter,
+	    int bits)
 {
   get_histogram (d_inputVals, numElems, d_absPos, idx_iter, bits);
   segmented_exclusive_scan (d_absPos, numBins, 1);
@@ -293,7 +294,8 @@ get_absPos (unsigned int* const d_inputVals, const size_t numElems,
 
 void
 get_relPos (unsigned int* const d_inputVals, const size_t numElems,
-	    unsigned int* d_relPos, int numBins, int idx_iter, int bits)
+	    unsigned int* d_relPos, const size_t numBins, int idx_iter,
+	    int bits)
 {
   const dim3 blockSize (32, 32);
   const dim3 gridSize (numElems / blockSize.x + 1, numBins / blockSize.y + 1);
@@ -310,7 +312,8 @@ get_relPos (unsigned int* const d_inputVals, const size_t numElems,
   int padding = pow (2, (int) (log2 ((float) numElems)) + 1) - numElems;
   int padded_numElems = padding + numElems;
 
-  checkCudaErrors(cudaMalloc (&d_scan, sizeof(unsigned int) * padded_numElems * numBins));
+  checkCudaErrors(
+      cudaMalloc (&d_scan, sizeof(unsigned int) * padded_numElems * numBins));
   checkCudaErrors(
       cudaMemcpy (d_scan, d_mask, sizeof(unsigned int) * numElems * numBins,
 		  cudaMemcpyDeviceToDevice));
@@ -318,8 +321,28 @@ get_relPos (unsigned int* const d_inputVals, const size_t numElems,
   segmented_exclusive_scan (d_scan, padded_numElems, numBins);
 
   // merge segments
-  merge_segments <<<numElems / 32 + 1, 32>>> (d_scan, d_mask,
-					      numElems, d_relPos, numBins);
+  merge_segments <<<numElems / 32 + 1, 32>>> (d_scan, d_mask, numElems,
+					      d_relPos, numBins);
+}
+
+__global__ void
+scatter (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
+	 const int numElems, int idx_iter, const int bits,
+	 unsigned int* d_absPos, unsigned int* d_relPos,
+	 unsigned int* const d_outputVals, unsigned int* const d_outputPos)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx >= numElems)
+    {
+      return;
+    }
+
+  int bin = get_bin (d_inputVals[idx], idx_iter, bits);
+  int pos = d_absPos[bin] + d_relPos[idx];
+  assert(pos < numElems);
+  d_outputVals[pos] = d_inputVals[idx];
+  d_outputPos[pos] = d_inputPos[idx];
 }
 
 void
@@ -327,23 +350,47 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
 	   unsigned int* const d_outputVals, unsigned int* const d_outputPos,
 	   const size_t numElems)
 {
+  // TODO get absPos and get relPos could be done in parallel using Stream
+
+  dprint<unsigned int> (d_inputVals, 100);
+
   const int N_BITS = 4;
-  const int numBins = pow (2, N_BITS);
+  const size_t numBins = pow (2, N_BITS);
+  int numIters = CHAR_BIT * sizeof(unsigned int) / N_BITS;
 
-  int idx_iter = 0;
-
-  unsigned int *d_absPos;
+  unsigned int *d_absPos, *d_relPos;
   checkCudaErrors(cudaMalloc (&d_absPos, sizeof(unsigned int) * numBins));
-  get_absPos (d_inputVals, numElems, d_absPos, numBins, idx_iter, N_BITS);
-
-  unsigned int *d_relPos;
   checkCudaErrors(cudaMalloc (&d_relPos, sizeof(unsigned int) * numElems));
-  get_relPos (d_inputVals, numElems, d_relPos, numBins, idx_iter, N_BITS);
 
-  // scatter, iterations
-  // make sure copy to output buffer
+  unsigned int* t_inputVals = d_inputVals, *t_inputPos = d_inputPos,
+      *t_outputVals = d_outputVals, *t_outputPos = d_outputPos;
+  for (int i = 0; i < numIters; i++)
+    {
+      checkCudaErrors(cudaMemset (d_absPos, 0, sizeof(unsigned int) * numBins));
+      get_absPos (t_inputVals, numElems, d_absPos, numBins, i, N_BITS);
 
-  // get absPos and get relPos could be done in parallel using Stream
+      checkCudaErrors(cudaMemset (d_relPos, 0, sizeof(numElems)));
+      get_relPos (t_inputVals, numElems, d_relPos, numBins, i, N_BITS);
+
+      scatter <<<numElems / 32 + 1, 32>>> (t_inputVals, t_inputPos, numElems, i,
+					   N_BITS, d_absPos, d_relPos,
+					   t_outputVals, t_outputPos);
+
+      t_inputVals = d_outputVals, t_inputPos = d_outputPos;
+      t_outputVals = d_inputVals, t_outputPos = d_inputPos;
+    }
+
+  if (numIters % 2 == 0)
+    {
+      checkCudaErrors(
+	  cudaMemcpy (d_outputVals, d_inputVals,
+		      sizeof(unsigned int) * numElems,
+		      cudaMemcpyDeviceToDevice));
+      checkCudaErrors(
+	  cudaMemcpy (d_outputPos, d_inputPos, sizeof(unsigned int) * numElems,
+		      cudaMemcpyDeviceToDevice));
+    }
+  dprint<unsigned int> (d_outputVals, 100);
 
   // cleanup
   checkCudaErrors(cudaFree (d_absPos));
