@@ -352,9 +352,7 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
 {
   // TODO get absPos and get relPos could be done in parallel using Stream
 
-  dprint<unsigned int> (d_inputVals, 100);
-
-  const int N_BITS = 4;
+  const int N_BITS = 4;  // power of 2
   const size_t numBins = pow (2, N_BITS);
   int numIters = CHAR_BIT * sizeof(unsigned int) / N_BITS;
 
@@ -376,8 +374,8 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
 					   N_BITS, d_absPos, d_relPos,
 					   t_outputVals, t_outputPos);
 
-      t_inputVals = d_outputVals, t_inputPos = d_outputPos;
-      t_outputVals = d_inputVals, t_outputPos = d_inputPos;
+      swap(t_inputVals, t_outputVals);
+      swap(t_inputPos, t_outputPos);
     }
 
   if (numIters % 2 == 0)
@@ -390,7 +388,6 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
 	  cudaMemcpy (d_outputPos, d_inputPos, sizeof(unsigned int) * numElems,
 		      cudaMemcpyDeviceToDevice));
     }
-  dprint<unsigned int> (d_outputVals, 100);
 
   // cleanup
   checkCudaErrors(cudaFree (d_absPos));
