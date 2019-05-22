@@ -88,15 +88,15 @@ histogram (unsigned int* const d_inputVals, const unsigned int numPixels,
 unsigned int*
 get_histogram (unsigned int* const d_inputVals, const size_t numPixels,
 	       unsigned int* d_absPos, const size_t idx_iter, const int bits,
-	       bool is_reference = false)
+	       cudaStream_t stream, bool is_reference = false)
 {
   const unsigned int numBins = pow (2, bits);
 
   const dim3 blockSize (32 * 32);
   const dim3 gridSize (numPixels / blockSize.x + 1);
 
-  histogram <<<gridSize, blockSize>>> (d_inputVals, numPixels, d_absPos, bits,
-				       idx_iter);
+  histogram <<<gridSize, blockSize, 0, stream>>> (d_inputVals, numPixels, d_absPos,
+					       bits, idx_iter);
 
   if (is_reference)
     {
@@ -195,7 +195,7 @@ downswipe_scan (unsigned int* const d_input, unsigned int numElem, int stride,
 
 void
 segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
-			  const int numSegs = 1)
+			  const int numSegs, cudaStream_t stream)
 {
   assert((numElems & (numElems - 1)) == 0); //numElems must be power of 2;
 
@@ -208,8 +208,8 @@ segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
 
       dim3 blockSize (32, 32);
       dim3 gridSize (numThreads / blockSize.x + 1, numSegs / blockSize.y + 1);
-      reduce_scan <<<gridSize, blockSize>>> (d_data, numElems, stride,
-					     numThreads, numSegs);
+      reduce_scan <<<gridSize, blockSize, 0, stream>>> (d_data, numElems, stride,
+						     numThreads, numSegs);
     }
 
   checkCudaErrors(
@@ -223,8 +223,9 @@ segmented_exclusive_scan (unsigned int* const d_data, const size_t numElems,
 
       dim3 blockSize (32, 32);
       dim3 gridSize (numThreads / blockSize.x + 1, numSegs / blockSize.y + 1);
-      downswipe_scan <<<gridSize, blockSize>>> (d_data, numElems, stride,
-						numThreads, numSegs);
+      downswipe_scan <<<gridSize, blockSize, 0, stream>>> (d_data, numElems,
+							stride, numThreads,
+							numSegs);
     }
 }
 
@@ -286,16 +287,16 @@ merge_segments (unsigned int* const d_input, unsigned int* const d_mask,
 void
 get_absPos (unsigned int* const d_inputVals, const size_t numElems,
 	    unsigned int* d_absPos, const size_t numBins, int idx_iter,
-	    int bits)
+	    int bits, cudaStream_t stream)
 {
-  get_histogram (d_inputVals, numElems, d_absPos, idx_iter, bits);
-  segmented_exclusive_scan (d_absPos, numBins, 1);
+  get_histogram (d_inputVals, numElems, d_absPos, idx_iter, bits, stream);
+  segmented_exclusive_scan (d_absPos, numBins, 1, stream);
 }
 
 void
 get_relPos (unsigned int* const d_inputVals, const size_t numElems,
 	    unsigned int* d_relPos, const size_t numBins, int idx_iter,
-	    int bits)
+	    int bits, cudaStream_t stream)
 {
   const dim3 blockSize (32, 32);
   const dim3 gridSize (numElems / blockSize.x + 1, numBins / blockSize.y + 1);
@@ -304,8 +305,9 @@ get_relPos (unsigned int* const d_inputVals, const size_t numElems,
   unsigned int* d_mask;
   checkCudaErrors(
       cudaMalloc (&d_mask, sizeof(unsigned int) * numElems * numBins));
-  segmented_mask <<<gridSize, blockSize>>> (d_inputVals, numElems, d_mask,
-					    numBins, idx_iter, bits);
+  segmented_mask <<<gridSize, blockSize, 0, stream>>> (d_inputVals, numElems,
+						    d_mask, numBins, idx_iter,
+						    bits);
 
   // segmented exclusive scan
   unsigned int* d_scan;
@@ -315,14 +317,15 @@ get_relPos (unsigned int* const d_inputVals, const size_t numElems,
   checkCudaErrors(
       cudaMalloc (&d_scan, sizeof(unsigned int) * padded_numElems * numBins));
   checkCudaErrors(
-      cudaMemcpy (d_scan, d_mask, sizeof(unsigned int) * numElems * numBins,
-		  cudaMemcpyDeviceToDevice));
+      cudaMemcpyAsync (d_scan, d_mask,
+		       sizeof(unsigned int) * numElems * numBins,
+		       cudaMemcpyDeviceToDevice, stream));
 
-  segmented_exclusive_scan (d_scan, padded_numElems, numBins);
+  segmented_exclusive_scan (d_scan, padded_numElems, numBins, stream);
 
   // merge segments
-  merge_segments <<<numElems / 32 + 1, 32>>> (d_scan, d_mask, numElems,
-					      d_relPos, numBins);
+  merge_segments <<<numElems / 32 + 1, 32, 0, stream>>> (d_scan, d_mask, numElems,
+						      d_relPos, numBins);
 }
 
 __global__ void
@@ -356,6 +359,10 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
   const size_t numBins = pow (2, N_BITS);
   int numIters = CHAR_BIT * sizeof(unsigned int) / N_BITS;
 
+  cudaStream_t s_abs, s_rel;
+  cudaStreamCreate (&s_abs);
+  cudaStreamCreate (&s_rel);
+
   unsigned int *d_absPos, *d_relPos;
   checkCudaErrors(cudaMalloc (&d_absPos, sizeof(unsigned int) * numBins));
   checkCudaErrors(cudaMalloc (&d_relPos, sizeof(unsigned int) * numElems));
@@ -365,17 +372,17 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
   for (int i = 0; i < numIters; i++)
     {
       checkCudaErrors(cudaMemset (d_absPos, 0, sizeof(unsigned int) * numBins));
-      get_absPos (t_inputVals, numElems, d_absPos, numBins, i, N_BITS);
+      get_absPos (t_inputVals, numElems, d_absPos, numBins, i, N_BITS, s_abs);
 
       checkCudaErrors(cudaMemset (d_relPos, 0, sizeof(numElems)));
-      get_relPos (t_inputVals, numElems, d_relPos, numBins, i, N_BITS);
+      get_relPos (t_inputVals, numElems, d_relPos, numBins, i, N_BITS, s_rel);
 
       scatter <<<numElems / 32 + 1, 32>>> (t_inputVals, t_inputPos, numElems, i,
 					   N_BITS, d_absPos, d_relPos,
 					   t_outputVals, t_outputPos);
 
-      swap(t_inputVals, t_outputVals);
-      swap(t_inputPos, t_outputPos);
+      swap (t_inputVals, t_outputVals);
+      swap (t_inputPos, t_outputPos);
     }
 
   if (numIters % 2 == 0)
@@ -392,5 +399,8 @@ your_sort (unsigned int* const d_inputVals, unsigned int* const d_inputPos,
   // cleanup
   checkCudaErrors(cudaFree (d_absPos));
   checkCudaErrors(cudaFree (d_relPos));
+
+  checkCudaErrors(cudaStreamDestroy(s_abs));
+  checkCudaErrors(cudaStreamDestroy(s_rel));
 
 }
