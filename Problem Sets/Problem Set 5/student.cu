@@ -37,15 +37,37 @@ histoSerial (const unsigned int* const vals, unsigned int* const histo,
     }
 }
 
-// TODO parallel code
-// TODO considering data dist (normal dist)
+__global__
+void
+histoAtomicAdd (const unsigned int* const vals, unsigned int* const histo,
+		int numVals)
+{
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx >= numVals)
+    {
+      return;
+    }
+
+  atomicAdd (&histo[vals[idx]], 1);
+}
 
 void
 computeHistogram (const unsigned int* const d_vals, //INPUT
     unsigned int* const d_histo,      //OUTPUT
     const unsigned int numBins, const unsigned int numElems)
 {
-  histoSerial <<<1, 1>>> (d_vals, d_histo, numElems);
+  /* 1. serial version */
+//  histoSerial <<<1, 1>>> (d_vals, d_histo, numElems);  // over 800 ms
+
+  /* 2. using global memory and atomic add */
+  dim3 block(32);
+  dim3 grid(numElems / block.x + 1);
+  histoAtomicAdd <<<grid, block>>> (d_vals, d_histo, numElems);  // around 3.1 ms
+
+  /* TODO 3. using shared memory */
+
+  /* TODO 4. considering data dist (normal dist) */
 
   cudaDeviceSynchronize ();
   checkCudaErrors(cudaGetLastError ());
