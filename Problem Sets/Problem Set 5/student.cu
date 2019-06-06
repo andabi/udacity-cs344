@@ -60,8 +60,9 @@ build_group (const unsigned int* const d_vals, unsigned int* const d_group,
 	     int numVals, int binSize)
 {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int bin_idx = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if (idx >= numVals)
+  if (idx >= numVals || bin_idx >= binSize)
     {
       return;
     }
@@ -69,17 +70,46 @@ build_group (const unsigned int* const d_vals, unsigned int* const d_group,
   int n_groups = (numVals + binSize - 1) / binSize;
   int bin = idx / n_groups;
 //  printf("n_groups: %d, bin: %d\n", n_groups, bin);
-  d_group[bin * numVals + idx] = d_vals[idx];
+  d_group[bin * numVals + idx] = (bin_idx == bin) ? d_vals[idx] : -1;
 }
 
-//__global__
-//void
-//histoSharedMem (const unsigned int* const d_vals, unsigned int* const d_histo,
-//		int numVals, int coarseBinSize = 1024)
-//{
-//  __shared__ unsigned int coarse_bin[coarseBinSize];
-//
-//}
+__global__
+void
+histoSharedMem (const unsigned int* const d_group, unsigned int* const d_histo,
+		int numVals, int coarseBinSize, int numThreads)
+{
+  extern __shared__ unsigned int histo_sh[];
+
+  int tx = threadIdx.x;
+  int group_idx = blockIdx.x;
+
+  // TODO out-of-range check
+
+  int numValsPerThreads = (numVals + numThreads - 1) / numThreads;
+
+  int idx = tx * numValsPerThreads;
+  if (idx >= numVals) {
+      return;
+  }
+
+  for (int i=idx; i<min(numVals, idx + numValsPerThreads); i++)
+    {
+       int val = d_group[group_idx * numVals + i];
+       if (val >= 0)
+	 {
+	   atomicAdd(&histo_sh[val - group_idx * coarseBinSize], 1);
+	 }
+    }
+  __syncthreads();
+
+  if (tx == 0)
+    {
+      for (int i=0; i<coarseBinSize; i++)
+	{
+  	  d_histo[group_idx * coarseBinSize + i] = histo_sh[i];
+	}
+    }
+}
 
 void
 computeHistogram (const unsigned int* const d_vals, //INPUT
@@ -107,13 +137,15 @@ computeHistogram (const unsigned int* const d_vals, //INPUT
 //  histoAtomicAdd <<<(numElems + 31) / 32, 32>>> (d_vals, d_histo, numElems); // around 3.1 ms
 
   /* TODO 3. using shared memory */
-  const int COARSE_BIN_SIZE = 128;  // TODO experiment on the best size
+  const int COARSE_BIN_SIZE = 16;  // TODO experiment on the best size
 
   unsigned int* d_group;
   checkCudaErrors(
       cudaMalloc (&d_group, sizeof(unsigned int) * COARSE_BIN_SIZE * numElems));
+  build_group<<<dim3((numElems + 31) / 32, 32), dim3(32, 1)>>> (d_vals, d_group, numElems, COARSE_BIN_SIZE);
 
-  build_group<<<(numElems + 31) / 32, 32>>> (d_vals, d_group, numElems, COARSE_BIN_SIZE);
+  int n_groups = (numElems + COARSE_BIN_SIZE - 1) / COARSE_BIN_SIZE;
+  histoSharedMem<<<n_groups, 32>>>(d_group, d_histo, numElems, COARSE_BIN_SIZE, 32);
 
   /* TODO 4. considering data dist (normal dist) */
 
