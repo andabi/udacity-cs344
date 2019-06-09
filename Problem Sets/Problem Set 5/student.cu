@@ -31,9 +31,9 @@
 __global__
 void
 histoSerial (const unsigned int* const d_vals, unsigned int* const d_histo,
-	     int numVals)
+	     int numElems)
 {
-  for (int i = 0; i < numVals; i++)
+  for (int i = 0; i < numElems; i++)
     {
       d_histo[d_vals[i]] += 1;
     }
@@ -42,41 +42,65 @@ histoSerial (const unsigned int* const d_vals, unsigned int* const d_histo,
 __global__
 void
 histoAtomicAdd (const unsigned int* const d_vals, unsigned int* const d_histo,
-		int numVals)
+		int numElems)
 {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (idx >= numVals)
-    {
+  if (idx >= numElems)
       return;
-    }
 
   atomicAdd (&d_histo[d_vals[idx]], 1);
 }
 
 __global__
 void
-build_group (const unsigned int* const d_vals, unsigned int* const d_group,
-	     int numVals, int binSize)
+histoSharedAtomicAdd(const unsigned int* const d_vals, unsigned int* const d_histo, int numElems, int numBins)
 {
+  extern __shared__ unsigned int sh_histo[];
+
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int bin_idx = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if (idx >= numVals || bin_idx >= binSize)
+  if (idx >= numElems)
+    return;
+
+  // initialize sh_histo
+  for (int i=threadIdx.x; i<numBins; i+=blockDim.x)
     {
-      return;
+      sh_histo[i] = 0;
     }
+  __syncthreads();
 
-  int n_groups = (numVals + binSize - 1) / binSize;
-  int bin = idx / n_groups;
-//  printf("n_groups: %d, bin: %d\n", n_groups, bin);
-  d_group[bin * numVals + idx] = (bin_idx == bin) ? d_vals[idx] : -1;
+  atomicAdd (&sh_histo[d_vals[idx]], 1);
+  __syncthreads();
+
+  // sum up to d_histo
+  for (int i=threadIdx.x; i<numBins; i+=blockDim.x)
+    {
+      atomicAdd (&d_histo[i], sh_histo[i]);
+    }
 }
 
 __global__
 void
-histoSharedMem (const unsigned int* const d_group, unsigned int* const d_histo,
-		int numVals, int coarseBinSize, int numThreads)
+build_group (const unsigned int* const d_vals, unsigned int* const d_group,
+	     int numElems, int binSize)
+{
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int bin_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (idx >= numElems || bin_idx >= binSize)
+      return;
+
+  int n_groups = (numElems + binSize - 1) / binSize;
+  int bin = idx / n_groups;
+//  printf("n_groups: %d, bin: %d\n", n_groups, bin);
+  d_group[bin * numElems + idx] = (bin_idx == bin) ? d_vals[idx] : -1;
+}
+
+__global__
+void
+histoShared (const unsigned int* const d_group, unsigned int* const d_histo,
+		int numElems, int coarseBinSize, int numThreads)
 {
   extern __shared__ unsigned int histo_sh[];
 
@@ -85,16 +109,15 @@ histoSharedMem (const unsigned int* const d_group, unsigned int* const d_histo,
 
   // TODO out-of-range check
 
-  int numValsPerThreads = (numVals + numThreads - 1) / numThreads;
+  int numElemsPerThreads = (numElems + numThreads - 1) / numThreads;
 
-  int idx = tx * numValsPerThreads;
-  if (idx >= numVals) {
+  int idx = tx * numElemsPerThreads;
+  if (idx >= numElems)
       return;
-  }
 
-  for (int i=idx; i<min(numVals, idx + numValsPerThreads); i++)
+  for (int i=idx; i<min(numElems, idx + numElemsPerThreads); i++)
     {
-       int val = d_group[group_idx * numVals + i];
+       int val = d_group[group_idx * numElems + i];
        if (val >= 0)
 	 {
 	   atomicAdd(&histo_sh[val - group_idx * coarseBinSize], 1);
@@ -116,38 +139,47 @@ computeHistogram (const unsigned int* const d_vals, //INPUT
     unsigned int* const d_histo,      //OUTPUT
     const unsigned int numBins, const unsigned int numElems)
 {
-  int dev = 0;
-  cudaSetDevice (dev);
+//  int dev = 0;
+//  cudaSetDevice (dev);
+//
+//  cudaDeviceProp devProps;
+//  if (cudaGetDeviceProperties (&devProps, dev) == 0)
+//    {
+//      printf ("Using device %d:\n", dev);
+//      printf (
+//	  "%s; global mem: %luMB; shared mem: %luKB; max threads per block: %d\n",
+//	  devProps.name, devProps.totalGlobalMem / 1024 / 1024,
+//	  devProps.sharedMemPerBlock / 1024, devProps.maxThreadsPerBlock);
+//    }
+//
+//  printf("# elems: %d, # bins: %d\n", numElems, numBins);
 
-  cudaDeviceProp devProps;
-  if (cudaGetDeviceProperties (&devProps, dev) == 0)
-    {
-      printf ("Using device %d:\n", dev);
-      printf (
-	  "%s; global mem: %luMB; shared mem: %luKB; max threads per block: %d\n",
-	  devProps.name, devProps.totalGlobalMem / 1024 / 1024,
-	  devProps.sharedMemPerBlock / 1024, devProps.maxThreadsPerBlock);
-    }
+  /* serial version */
+//  histoSerial <<<1, 1>>> (d_vals, d_histo, numElems);
+  /* perf: over 800 ms */
 
-  printf("# elems: %d\n", numElems);
+  /* using global memory and atomic add */
+//  const int N_THREADS = 1024;
+//  histoAtomicAdd <<<(numElems + N_THREADS - 1) / N_THREADS, N_THREADS>>> (d_vals, d_histo, numElems);
+  /* perf: around 3.1 ms */
 
-  /* 1. serial version */
-//  histoSerial <<<1, 1>>> (d_vals, d_histo, numElems);  // over 800 ms
-  /* 2. using global memory and atomic add */
-//  histoAtomicAdd <<<(numElems + 31) / 32, 32>>> (d_vals, d_histo, numElems); // around 3.1 ms
+  /* using shared memory and atomic add */
+//  const int N_THREADS = 1024;
+//  histoSharedAtomicAdd <<<(numElems + N_THREADS - 1) / N_THREADS, N_THREADS, sizeof(unsigned int) * numBins>>> (d_vals, d_histo, numElems, numBins);
+  /* perf: around 0.19 ms */
 
-  /* TODO 3. using shared memory */
-  const int COARSE_BIN_SIZE = 16;  // TODO experiment on the best size
+  /* TODO using shared memory */
+//  const int COARSE_BIN_SIZE = 16;  // TODO experiment on the best size
+//
+//  unsigned int* d_group;
+//  checkCudaErrors(
+//      cudaMalloc (&d_group, sizeof(unsigned int) * COARSE_BIN_SIZE * numElems));
+//  build_group<<<dim3((numElems + 31) / 32, 32), dim3(32, 1)>>> (d_vals, d_group, numElems, COARSE_BIN_SIZE);
+//
+//  int n_groups = (numElems + COARSE_BIN_SIZE - 1) / COARSE_BIN_SIZE;
+//  histoShared<<<n_groups, 32>>>(d_group, d_histo, numElems, COARSE_BIN_SIZE, 32);
 
-  unsigned int* d_group;
-  checkCudaErrors(
-      cudaMalloc (&d_group, sizeof(unsigned int) * COARSE_BIN_SIZE * numElems));
-  build_group<<<dim3((numElems + 31) / 32, 32), dim3(32, 1)>>> (d_vals, d_group, numElems, COARSE_BIN_SIZE);
-
-  int n_groups = (numElems + COARSE_BIN_SIZE - 1) / COARSE_BIN_SIZE;
-  histoSharedMem<<<n_groups, 32>>>(d_group, d_histo, numElems, COARSE_BIN_SIZE, 32);
-
-  /* TODO 4. considering data dist (normal dist) */
+  /* TODO considering data dist (normal dist) */
 
   cudaDeviceSynchronize ();
   checkCudaErrors(cudaGetLastError ());
